@@ -1,0 +1,15 @@
+node_modules/
+test-results/
+playwright-report/
+blob-report/
+playwright/.cache/
+.env
+*.log
+dist/
+venv/
+__pycache__/
+*.csv
+error_screenshots/
+browser_profile/
+.DS_Store
+sults/
