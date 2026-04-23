@@ -1,27 +1,48 @@
-# rxscrape
+# GoodRx Price Scraper (rxscrape)
 
-A tool leveraging Playwright for efficient web scraping.
+A robust, stealth-enabled Python scraper built with Playwright to extract generic drug pricing data from GoodRx.com across multiple US zip codes.
+
+## Features
+- **PerimeterX Bypass**: Advanced CAPTCHA solver using Bezier mouse curves and randomized jitter.
+- **Stealth Configuration**: Utilizes `playwright-stealth` and persistent browser profiles to mimic human behavior.
+- **Retail Price Extraction**: Automatically reveals hidden retail prices by interacting with pharmacy rows.
+- **Data Persistence**: Saves results immediately to `national_pharmacy_pricing.csv`.
 
 ## Getting Started
 
 ### Prerequisites
-
-- Node.js (v16+)
-- npm
+- Python 3.9+
+- [uv](https://github.com/astral-sh/uv) (recommended) or `pip`
 
 ### Installation
+1. Clone the repository:
+   ```bash
+   git clone https://github.com/walshkang/rxscrape.git
+   cd rxscrape
+   ```
 
-```bash
-git clone https://github.com/walsh-kang/rxscrape.git
-cd rxscrape
-npm install
-```
+2. Create and activate a virtual environment:
+   ```bash
+   python3 -m venv venv
+   source venv/bin/activate
+   ```
+
+3. Install dependencies:
+   ```bash
+   pip install -r requirements.txt
+   playwright install chromium
+   ```
 
 ### Usage
-
-[TBD - Initializing project]
+Run the scraper:
+```bash
+python3 scraper.py
+```
+The scraper will loop through pre-configured drugs and zip codes, saving the data to `national_pharmacy_pricing.csv`.
 
 ## Development
+- `pytest`: Run unit tests for data cleaning logic.
+- `error_screenshots/`: Check this directory for screenshots of any failed extraction attempts for debugging.
 
-- `npm run test`: Run Playwright tests
-- `npx playwright show-report`: View test reports
+## License
+MIT
