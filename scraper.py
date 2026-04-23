@@ -5,7 +5,7 @@ import random
 import re
 import math
 from datetime import datetime
-from playwright.async_api import async_playwright, expect
+from playwright.async_api import async_playwright, expect, TimeoutError as PlaywrightTimeoutError
 from playwright_stealth import Stealth
 from scraper_utils import parse_price
 
@@ -20,6 +20,53 @@ USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36
 CSV_FILE = "national_pharmacy_pricing.csv"
 SCREENSHOT_DIR = "error_screenshots"
 USER_DATA_DIR = "browser_profile"
+LOCATION_TRIGGER_RE = re.compile(r"\d{5}|Set location|Your location|Current location", re.I)
+
+
+class ScrapeError(Exception):
+    pass
+
+
+class LocationTriggerError(ScrapeError):
+    pass
+
+
+class LocationModalError(ScrapeError):
+    pass
+
+
+class ZipInputError(ScrapeError):
+    pass
+
+
+class ResultsNotFoundError(ScrapeError):
+    pass
+
+
+def fail_step(step: str, exc: BaseException, drug_name: str, zip_code: str) -> str:
+    return f"  FAILED [{drug_name} {zip_code}::{step}] {type(exc).__name__}: {exc}"
+
+
+def location_trigger_locator(page):
+    # Prefer semantic button matching, then aria-label fallbacks.
+    return page.get_by_role("button", name=LOCATION_TRIGGER_RE)
+
+
+async def first_visible_text(row, selector_candidates, timeout_ms=2500):
+    """Return first visible non-empty text from selector candidates in a row."""
+    for sel in selector_candidates:
+        loc = row.locator(sel)
+        try:
+            if await loc.count() == 0:
+                continue
+            candidate = loc.first
+            await expect(candidate).to_be_visible(timeout=timeout_ms)
+            txt = (await candidate.inner_text(timeout=timeout_ms)).strip()
+            if txt:
+                return txt
+        except Exception:
+            continue
+    return None
 
 async def human_delay(min_s=2, max_s=4):
     await asyncio.sleep(random.uniform(min_s, max_s))
@@ -102,7 +149,7 @@ async def check_and_handle_captcha(page):
             if await button.count() > 0:
                 print(f"    Found button in frame: {frame.url[:40]}...")
                 return await solve_px_captcha_button(page, button.first)
-        except:
+        except Exception:
             continue
             
     # 3. If "Before we continue" text is present, wait and retry
@@ -112,6 +159,78 @@ async def check_and_handle_captcha(page):
         return await check_and_handle_captcha(page)
             
     return False
+
+def location_modal(page):
+    """
+    GoodRx's ZIP modal; must not use a generic [role=dialog] — Osano cookies also
+    expose role=dialog+aria-modal while hidden, which breaks strict locators.
+    """
+    return page.get_by_test_id("locationModal")
+
+async def clear_px_captcha_if_blocking(page, max_passes: int = 6):
+    """#px-captcha-modal sits above the page and blocks clicks on the location control."""
+    for _ in range(max_passes):
+        iframe = page.locator("iframe#px-captcha-modal")
+        if await iframe.count() == 0:
+            return True
+        try:
+            if not await iframe.first.is_visible():
+                return True
+        except Exception:
+            return True
+        solved = await check_and_handle_captcha(page)
+        if not solved:
+            await asyncio.sleep(1.2)
+    # Best-effort: if still visible we return False so callers can escalate/retry.
+    iframe = page.locator("iframe#px-captcha-modal")
+    if await iframe.count() == 0:
+        return True
+    try:
+        return not await iframe.first.is_visible()
+    except Exception:
+        return True
+
+async def resolve_zip_input_locator(page, dialog):
+    """
+    Find the city/ZIP field inside the location UI. GoodRx has changed
+    placeholders/roles over time, so we try several accessibility-based locators
+    and fall back to the first visible text-like input in the dialog.
+    """
+    name_or_placeholder = re.compile(
+        r"zip|postal|city|state|location|search|enter|where|pharmacy|"
+        r"set\s*location|address|find|neighborhood",
+        re.I,
+    )
+    for root in (dialog, page):
+        strategies = [
+            root.get_by_role("combobox", name=name_or_placeholder),
+            root.get_by_role("textbox", name=name_or_placeholder),
+            root.get_by_placeholder(name_or_placeholder),
+            root.get_by_label(re.compile(r"zip|location|city|search|address|pharmacy", re.I)),
+            root.locator("input[autocomplete='postal-code']"),
+            root.locator("input[type='search']"),
+        ]
+        for strat in strategies:
+            try:
+                if await strat.count() == 0:
+                    continue
+                el = strat.first
+                await expect(el).to_be_visible(timeout=5000)
+                return el
+            except Exception:
+                continue
+    n = await dialog.locator("input").count()
+    for i in range(n):
+        inp = dialog.locator("input").nth(i)
+        t = (await inp.get_attribute("type") or "text").lower()
+        if t in ("hidden", "submit", "button", "checkbox", "radio", "file", "image"):
+            continue
+        try:
+            if await inp.is_visible():
+                return inp
+        except Exception:
+            continue
+    raise Exception("No zip/location input found (selectors out of date).")
 
 async def save_to_csv(data):
     file_exists = os.path.isfile(CSV_FILE)
@@ -126,43 +245,109 @@ async def scrape_drug_data(page, drug_name, zip_code):
     print(f"  Scraping {drug_name} in {zip_code}...")
     
     await check_and_handle_captcha(page)
-    
-    location_trigger = page.get_by_role("button", name=re.compile(r"\d{5}|Set location|Your location", re.I))
-    if await location_trigger.count() == 0:
-        if not await check_and_handle_captcha(page):
-             raise Exception("Location trigger missing and no captcha detected.")
-        location_trigger = page.get_by_role("button", name=re.compile(r"\d{5}|Set location|Your location", re.I))
+    await clear_px_captcha_if_blocking(page, max_passes=8)
 
-    await location_trigger.click()
-    
-    modal = page.get_by_role("dialog")
-    try:
-        await expect(modal).to_be_visible(timeout=7000)
-    except:
+    location_trigger = location_trigger_locator(page)
+    if await location_trigger.count() == 0:
+        await asyncio.sleep(2.0)
         await check_and_handle_captcha(page)
-        await location_trigger.click()
-        await expect(modal).to_be_visible(timeout=10000)
+        await clear_px_captcha_if_blocking(page, max_passes=8)
+        location_trigger = location_trigger_locator(page)
+    if await location_trigger.count() == 0:
+        location_trigger = page.locator(
+            "[aria-label*='Current location'], [aria-label*='Set your location'], "
+            "[data-qa='locationModalTrigger'], [data-testid='locationModalTrigger']"
+        )
+    if await location_trigger.count() == 0:
+        raise LocationTriggerError("Location trigger missing after captcha check and short retry.")
+
+    modal = location_modal(page)
+    modal_opened = False
+    last_modal_error = None
+    for modal_try in range(2):
+        try:
+            await clear_px_captcha_if_blocking(page, max_passes=8)
+            await location_trigger.first.click(timeout=15000)
+            await expect(modal).to_be_visible(timeout=7000)
+            modal_opened = True
+            break
+        except Exception as exc:
+            last_modal_error = exc
+            await check_and_handle_captcha(page)
+            await clear_px_captcha_if_blocking(page, max_passes=8)
+            try:
+                await location_trigger.first.click(timeout=30000, force=True)
+                await expect(modal).to_be_visible(timeout=10000)
+                modal_opened = True
+                break
+            except Exception as retry_exc:
+                last_modal_error = retry_exc
+                if modal_try == 0:
+                    await asyncio.sleep(1.5)
+                    location_trigger = location_trigger_locator(page)
+                    continue
+    if not modal_opened:
+        raise LocationModalError("Could not open location modal.") from last_modal_error
+    await asyncio.sleep(0.4)
     
-    # More robust input locator
-    zip_input = page.locator('input[placeholder*="ZIP" i], input[placeholder*="zip" i], input[placeholder*="city" i]')
-    await expect(zip_input.first).to_be_visible(timeout=10000)
+    try:
+        zip_input = await resolve_zip_input_locator(page, modal)
+    except Exception as exc:
+        raise ZipInputError("No zip/location input found in location modal.") from exc
+    await zip_input.click(force=True)
+    await zip_input.press("Meta+A")
+    await zip_input.press("Backspace")
     
-    await zip_input.first.click(force=True)
-    await zip_input.first.press("Meta+A")
-    await zip_input.first.press("Backspace")
-    
-    # Natural typing
     for char in zip_code:
-        await zip_input.first.type(char, delay=random.randint(150, 400))
+        await zip_input.type(char, delay=random.randint(150, 400))
         await asyncio.sleep(random.uniform(0.05, 0.1))
+    # Some GoodRx variants require committing the combobox value.
+    try:
+        await zip_input.press("Enter")
+    except Exception:
+        pass
+    await asyncio.sleep(0.6)
     
-    set_button = page.get_by_role("button", name=re.compile(r"Set location|Save|Update", re.I))
-    await set_button.click()
-    await expect(modal).to_be_hidden(timeout=15000)
+    set_button = modal.get_by_role("button", name=re.compile(
+        r"Set location|Save|Update|Apply|Use this location|Confirm|Done", re.I
+    ))
+    if await set_button.count() == 0:
+        set_button = page.get_by_role("button", name=re.compile(
+            r"Set location|Save|Update|Apply|Use this location|Confirm|Done", re.I
+        ))
+    if await set_button.count() == 0:
+        set_button = modal.get_by_role("button", name=re.compile(
+            r"See prices|Search|Continue|View prices", re.I
+        ))
+    if await set_button.count() == 0:
+        raise LocationModalError("Set location button not found in location modal.")
+    await set_button.first.click()
+    try:
+        await expect(modal).to_be_hidden(timeout=10000)
+    except Exception:
+        # Retry by selecting first suggestion/option then resubmitting.
+        option = modal.get_by_role("option")
+        if await option.count() > 0:
+            await option.first.click()
+            await asyncio.sleep(0.3)
+        try:
+            await set_button.first.click(force=True)
+        except Exception:
+            try:
+                await zip_input.press("Enter")
+            except Exception:
+                pass
+        await expect(modal).to_be_hidden(timeout=12000)
     await check_and_handle_captcha(page)
     
-    price_rows_locator = page.locator('div[data-qa="pharmacy-row"], [class*="priceRow"]')
-    await expect(price_rows_locator.first).to_be_visible(timeout=20000)
+    price_rows_locator = page.locator(
+        'div[data-qa="pharmacy-row"], [class*="priceRow"], '
+        '[data-testid*="pharmacy"][data-testid*="row"], [data-qa*="pharmacy"][data-qa*="row"]'
+    )
+    try:
+        await expect(price_rows_locator.first).to_be_visible(timeout=25000)
+    except Exception as exc:
+        raise ResultsNotFoundError("Pharmacy rows did not appear after setting location.") from exc
     await human_delay(3, 5)
     
     results_count = 0
@@ -172,15 +357,53 @@ async def scrape_drug_data(page, drug_name, zip_code):
         if not await row.is_visible(): continue
             
         try:
-            pharmacy_name = await row.locator('h4, span[class*="pharmacyName"], strong').first.inner_text()
-            goodrx_price_text = await row.locator('[data-qa="price"], span[class*="price"]').first.inner_text()
+            pharmacy_name = await first_visible_text(
+                row,
+                [
+                    '[data-qa*="pharmacy"] h4',
+                    '[data-testid*="pharmacy"] h4',
+                    'h4',
+                    '[class*="pharmacyName"]',
+                    '[data-qa*="pharmacy-name"]',
+                    '[data-testid*="pharmacy-name"]',
+                    "strong",
+                ],
+            )
+            if not pharmacy_name:
+                # Fast fallback: parse row text to avoid 30s stalls.
+                row_text = await row.inner_text(timeout=2500)
+                pharmacy_name = next(
+                    (ln.strip() for ln in row_text.splitlines() if ln.strip() and not re.search(r"\$|coupon|retail|save", ln, re.I)),
+                    None,
+                )
+            if not pharmacy_name:
+                raise ValueError("Pharmacy name not found in row.")
+
+            goodrx_price_text = await first_visible_text(
+                row,
+                [
+                    '[data-qa="price"]',
+                    '[data-testid*="price"]',
+                    '[class*="price"]',
+                    'text=/\\$\\s?[0-9]/',
+                ],
+            )
+            if not goodrx_price_text:
+                row_text = await row.inner_text(timeout=2500)
+                price_match = re.search(r"\$[0-9,]+(?:\.[0-9]{2})?", row_text)
+                if price_match:
+                    goodrx_price_text = price_match.group(0)
+            if not goodrx_price_text:
+                raise ValueError("GoodRx price not found in row.")
             goodrx_price = parse_price(goodrx_price_text)
             
             retail_price = None
             retail_locator = row.locator('text=/Retail/i, text=/was/i')
             if await retail_locator.count() > 0:
-                try: retail_price = parse_price(await retail_locator.first.inner_text())
-                except: pass
+                try:
+                    retail_price = parse_price(await retail_locator.first.inner_text())
+                except Exception:
+                    retail_price = None
             
             if retail_price is None:
                 await row.click()
@@ -198,7 +421,9 @@ async def scrape_drug_data(page, drug_name, zip_code):
                 "GoodRx_Price": goodrx_price
             })
             results_count += 1
-        except: continue
+        except Exception as row_exc:
+            print(f"    Row parse skipped ({type(row_exc).__name__}): {row_exc}")
+            continue
 
 async def main():
     if not os.path.exists(SCREENSHOT_DIR): os.makedirs(SCREENSHOT_DIR)
@@ -233,7 +458,7 @@ async def main():
                     except Exception as e:
                         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
                         await page.screenshot(path=os.path.join(SCREENSHOT_DIR, f"fail_{drug['name']}_{zip_code}_{ts}.png"))
-                        print(f"  FAILED: {e}")
+                        print(fail_step("zip_run", e, drug["name"], zip_code))
                         await page.goto(drug["url"], wait_until="domcontentloaded")
                         await human_delay(5, 8)
             except Exception as e:
@@ -243,4 +468,9 @@ async def main():
         print("Scraping complete.")
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("Stopped by user.")
+    except asyncio.CancelledError:
+        print("Run cancelled.")
