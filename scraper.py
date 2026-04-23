@@ -105,6 +105,9 @@ PHARMACY_LINE_JUNK = re.compile(
     r"^same[- ]day( pickup)?$|^(pick up|pickup|in stock|open now|closed|drive[- ]?thru)!?$|"
     r"^est\.?\s*retail|^mail order|^buy online|continue to"
 )
+GENERIC_PHARMACY_LABEL_RE = re.compile(
+    r"(?i)^(home\s*delivery|free\s*shipping|mail\s*order|buy\s*online|ship(?:ping)?\s*to\s*home|pick\s*up|pickup|delivery)$"
+)
 
 MAIL_ORDER_PHARMACY_RE = re.compile(
     # Only classify true mail-order labels/providers; allow local chains with delivery promos.
@@ -152,6 +155,8 @@ async def _first_plausible_n(row, sel: str, timeout_ms: int = 2500):
             if not await el.is_visible():
                 continue
             txt = (await el.inner_text(timeout=timeout_ms)).strip()
+            if GENERIC_PHARMACY_LABEL_RE.search(txt):
+                continue
             if is_plausible_pharmacy_name(txt):
                 return txt
         except Exception:
@@ -195,6 +200,8 @@ async def extract_pharmacy_name(row):
             continue
         # Drop price lines; let is_plausible_pharmacy_name handle marketing.
         if re.search(r"\$[0-9]", t):
+            continue
+        if GENERIC_PHARMACY_LABEL_RE.search(t):
             continue
         if is_plausible_pharmacy_name(t):
             return t
@@ -909,6 +916,35 @@ async def scrape_drug_data(page, drug_name, zip_code):
     lo, hi = DELAY_POST_RESULTS_VISIBLE_S
     await asyncio.sleep(random.uniform(lo, hi))
     print("    Phase: result rows on page; reading pharmacy rows")
+    print("    [DEBUG] Priming lazy-loaded rows...")
+    last_row_count = -1
+    stable_checks = 0
+    scrolled_down = False
+    for step in range(6):
+        try:
+            row_count = await price_rows_locator.count()
+        except Exception:
+            row_count = 0
+        print(f"    [DEBUG] Lazy-load primer step {step + 1}: row locator count={row_count}")
+        if row_count == last_row_count:
+            stable_checks += 1
+        else:
+            stable_checks = 0
+        if stable_checks >= 2 and row_count > 0:
+            break
+        try:
+            await page.mouse.wheel(0, 900)
+            scrolled_down = True
+        except Exception:
+            pass
+        await asyncio.sleep(random.uniform(0.4, 0.7))
+        last_row_count = row_count
+    if scrolled_down:
+        try:
+            await page.mouse.wheel(0, -1200)
+        except Exception:
+            pass
+        await asyncio.sleep(0.8)
     
     results_count = 0
     row_skip_count = 0
