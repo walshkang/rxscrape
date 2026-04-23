@@ -8,23 +8,31 @@ import time
 from datetime import datetime, timedelta
 from playwright.async_api import async_playwright, expect, TimeoutError as PlaywrightTimeoutError
 from playwright_stealth import Stealth
-from scraper_utils import parse_price
 
 # Configuration
 DRUGS = [
     {"name": "Atorvastatin", "url": "https://www.goodrx.com/atorvastatin"},
-    {"name": "Amoxicillin", "url": "https://www.goodrx.com/amoxicillin"},
-    {"name": "Imatinib", "url": "https://www.goodrx.com/imatinib"},
 ]
-ZIP_CODES = ['10012', '90210', '48201', '75024', '57701']
+ZIP_CODES = ['10012']
 USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-CSV_FILE = "national_pharmacy_pricing.csv"
+# One snapshot file per `main()` run (prices change over time; do not mix runs in one file).
+RUNS_DIR = "runs"
+OUTPUT_FIELDNAMES = [
+    "Date",
+    "Zip_Code",
+    "Drug_Name",
+    "Pharmacy_Name",
+    "Option_Type",
+    "Retail_Price",
+    "GoodRx_Price",
+]
+_run_csv_path: str | None = None
 SCREENSHOT_DIR = "error_screenshots"
 USER_DATA_DIR = "browser_profile"
 DOM_ARTIFACT_DIR = "error_dom_artifacts"
 LOCATION_TRIGGER_RE = re.compile(r"\d{5}|Set location|Your location|Current location", re.I)
-MAX_RESULTS_PER_ZIP = 3
-MAX_ROW_CANDIDATES = 10
+MAX_ROW_CANDIDATES = 30
+MAX_ROW_SCAN_PASSES = 4
 MAX_ROW_SKIP_BEFORE_ARTIFACT = 4
 MAX_ZIP_RETRIES = 2
 # Must cover: PerimeterX (several 8–12s holds + delays), location modal, human_delay,
@@ -33,6 +41,13 @@ ZIP_ATTEMPT_BUDGET_SEC = 360
 DOM_ARTIFACT_RETENTION_DAYS = 14
 CAPTCHA_MAX_SOLVE_ATTEMPTS = 3
 CAPTCHA_RECHECK_WAIT_SEC = 2.0
+# Tunable pacing (seconds, min–max). Shorter = faster; too low may look bot-like or race the UI.
+DELAY_POST_DRUG_LOAD_S = (2.0, 3.5)  # after drug URL; was ~4–6s
+DELAY_POST_RESULTS_VISIBLE_S = (1.0, 1.8)  # after pharmacy rows first visible; was ~3–5s
+DELAY_BETWEEN_ZIPS_S = (1.5, 3.5)  # after a successful zip; was ~5–10s
+DELAY_WARMUP_GOOGLE_S = (0.5, 1.0)  # after google hop; was ~1–2s
+DELAY_ON_ZIP_RETRY_S = (2.0, 3.5)  # reload after failed zip; was ~3–5s
+ZIP_TYPE_CHAR_DELAY_MS = (35, 75)  # one-shot type(); was 150–400ms per char
 
 
 class ScrapeError(Exception):
@@ -91,6 +106,12 @@ PHARMACY_LINE_JUNK = re.compile(
     r"^est\.?\s*retail|^mail order|^buy online|continue to"
 )
 
+MAIL_ORDER_PHARMACY_RE = re.compile(
+    # Only classify true mail-order labels/providers; allow local chains with delivery promos.
+    r"(?i)^home\s*delivery$|^free\s*shipping$|^mail\s*order$|^ship(?:ping)?\s*to\s*home$|^buy\s*online$|"
+    r"\bdirx\b|\bcost\s*plus\b|\bgeniusrx\b|\bhealthwarehouse\b"
+)
+
 
 def is_plausible_pharmacy_name(s: str) -> bool:
     t = (s or "").strip()
@@ -99,6 +120,23 @@ def is_plausible_pharmacy_name(s: str) -> bool:
     if PHARMACY_LINE_JUNK.search(t):
         return False
     return bool(re.search(r"[A-Za-z]", t))
+
+
+def is_mail_order_pharmacy(name: str) -> bool:
+    return bool(MAIL_ORDER_PHARMACY_RE.search((name or "").strip()))
+
+
+def extract_price_with_regex(text: str) -> float | None:
+    """Strict extraction using requested regex to clean up messy text blobs."""
+    if not text:
+        return None
+    match = re.search(r"\$([0-9,.]+)", text)
+    if match:
+        try:
+            return float(match.group(1).replace(",", ""))
+        except ValueError:
+            return None
+    return None
 
 
 async def _first_plausible_n(row, sel: str, timeout_ms: int = 2500):
@@ -362,10 +400,18 @@ async def resolve_zip_input_locator(page, dialog):
             continue
     raise Exception("No zip/location input found (selectors out of date).")
 
+def row_identity_key(pharmacy_name: str, goodrx: float) -> tuple:
+    """Deduplicate DOM copies of the same offer (name + GoodRx price per zip)."""
+    return (pharmacy_name.strip().lower(), round(goodrx, 2))
+
+
 async def save_to_csv(data):
-    file_exists = os.path.isfile(CSV_FILE)
-    with open(CSV_FILE, mode='a', newline='', encoding='utf-8') as f:
-        writer = csv.DictWriter(f, fieldnames=["Date", "Zip_Code", "Drug_Name", "Pharmacy_Name", "Retail_Price", "GoodRx_Price"])
+    path = _run_csv_path
+    if not path:
+        raise RuntimeError("Output CSV not set — run via main() so each run gets its own file under runs/.")
+    file_exists = os.path.isfile(path)
+    with open(path, mode='a', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=OUTPUT_FIELDNAMES)
         if not file_exists:
             writer.writeheader()
         writer.writerow(data)
@@ -587,10 +633,9 @@ def extract_retail_from_blurb(text: str):
         if "$" not in t or not t:
             continue
         if line_keywords.search(t):
-            try:
-                return parse_price(t)
-            except Exception:
-                continue
+            parsed = extract_price_with_regex(t)
+            if parsed is not None:
+                return parsed
     for pat in (
         r"(?i)retail[^$\n]{0,48}\$[0-9,]+\.[0-9]{2}",
         r"(?i)est\.?\s*retail[^$\n]{0,48}\$[0-9,]+\.[0-9]{2}",
@@ -599,14 +644,13 @@ def extract_retail_from_blurb(text: str):
     ):
         m = re.search(pat, text)
         if m:
-            try:
-                return parse_price(m.group(0))
-            except Exception:
-                continue
+            parsed = extract_price_with_regex(m.group(0))
+            if parsed is not None:
+                return parsed
     return None
 
 
-async def maybe_extract_retail_price(page, row):
+async def maybe_extract_retail_price(page, row, physical_pickup: bool):
     # Scroll so sticky footers and bottom price rows (retail) are in the layout viewport.
     try:
         await row.scroll_into_view_if_needed()
@@ -614,33 +658,34 @@ async def maybe_extract_retail_price(page, row):
     except Exception:
         pass
 
-    try:
-        blob = (await row.inner_text(timeout=3000)) or ""
-        got = extract_retail_from_blurb(blob)
-        if got is not None:
-            return got
-    except Exception:
-        pass
-
-    retail_text = await first_visible_text(
-        row,
-        [
-            'text=/Retail:?\\s*\\$[0-9]/i',
-            'text=/was\\s*\\$[0-9]/i',
-            'text=/Est\\.?\\s*retail/i',
-            'text=/Cash\\s*price/i',
-            'text=/Original\\s*price/i',
-            'text=/List\\s*price/i',
-            '[data-qa*="retail"]',
-            '[data-testid*="retail"]',
-        ],
-        timeout_ms=2000,
-    )
-    if retail_text:
+    if not physical_pickup:
         try:
-            return parse_price(retail_text)
+            blob = (await row.inner_text(timeout=3000)) or ""
+            got = extract_retail_from_blurb(blob)
+            if got is not None:
+                return got
         except Exception:
             pass
+
+        retail_text = await first_visible_text(
+            row,
+            [
+                'text=/Retail:?\\s*\\$[0-9]/i',
+                'text=/was\\s*\\$[0-9]/i',
+                'text=/Est\\.?\\s*retail/i',
+                'text=/Cash\\s*price/i',
+                'text=/Original\\s*price/i',
+                'text=/List\\s*price/i',
+                '[data-qa*="retail"]',
+                '[data-testid*="retail"]',
+            ],
+            timeout_ms=2000,
+        )
+        if retail_text:
+            parsed = extract_price_with_regex(retail_text)
+            if parsed is not None:
+                return parsed
+        return None
 
     await clear_known_interstitials(page)
     overlay_ok = await clear_savings_tip_overlay(page)
@@ -665,10 +710,28 @@ async def maybe_extract_retail_price(page, row):
             await row.click(timeout=3000, force=use_force)
         except Exception:
             await row.click(timeout=3000, force=True)
-        await asyncio.sleep(0.9)
+        await asyncio.sleep(random.uniform(1.0, 2.0))
+
+        main_retail_text = await first_visible_text(
+            page,
+            [
+                'text=/Retail:?\\s*\\$[0-9]/i',
+                'text=/Retail:?/i',
+                '[data-qa*="retail"]',
+                '[data-testid*="retail"]',
+            ],
+            timeout_ms=3500,
+        )
+        if main_retail_text:
+            parsed = extract_retail_from_blurb(main_retail_text)
+            if parsed is not None:
+                return parsed
+            parsed = extract_price_with_regex(main_retail_text)
+            if parsed is not None:
+                return parsed
 
         for loc in (
-            page.locator("text=/Retail:?\\s*\\$/i"),
+            page.get_by_text(re.compile(r"Retail:?\s*\$[0-9,]+\.[0-9]{2}", re.I)),
             page.get_by_text(re.compile(r"Est\.?\s*retail:?\s*\$", re.I)),
             page.get_by_text(re.compile(r"Typical\s+retail:?\s*\$", re.I)),
         ):
@@ -677,29 +740,13 @@ async def maybe_extract_retail_price(page, row):
                     continue
                 t = (await loc.first.inner_text(timeout=2000)).strip()
                 if t:
-                    return parse_price(t)
+                    parsed = extract_price_with_regex(t)
+                    if parsed is not None:
+                        return parsed
             except Exception:
                 continue
 
-        dialog_like = page.locator(
-            '[role="dialog"], '
-            '[data-state="open"][data-testid*="Modal"], [data-state="open"][data-testid*="modal"], '
-            '[data-state="open"][data-qa*="Modal"], [data-state="open"][data-qa*="modal"], '
-            "aside[open], [data-testid*=\"drawer\"][data-state=\"open\"]"
-        )
-        n = await dialog_like.count()
-        for i in range(min(n, 6)):
-            try:
-                d = dialog_like.nth(i)
-                if not await d.is_visible():
-                    continue
-                got = extract_retail_from_blurb(await d.inner_text(timeout=2500) or "")
-                if got is not None:
-                    return got
-            except Exception:
-                continue
-
-        return extract_retail_from_blurb(await page.locator("body").inner_text(timeout=2500) or "")
+        return None
     except Exception:
         return None
     finally:
@@ -709,7 +756,7 @@ async def maybe_extract_retail_price(page, row):
             pass
 
 async def scrape_drug_data(page, drug_name, zip_code):
-    """Scrapes top 3 pharmacy prices for a drug/zip."""
+    """Scrapes discoverable pharmacy options for a drug/zip."""
     t0 = time.monotonic()
     print(f"  Scraping {drug_name} in {zip_code}...")
     
@@ -769,9 +816,8 @@ async def scrape_drug_data(page, drug_name, zip_code):
     await zip_input.press("Meta+A")
     await zip_input.press("Backspace")
     
-    for char in zip_code:
-        await zip_input.type(char, delay=random.randint(150, 400))
-        await asyncio.sleep(random.uniform(0.05, 0.1))
+    lo, hi = ZIP_TYPE_CHAR_DELAY_MS
+    await zip_input.type(zip_code, delay=random.randint(lo, hi))
     # Some GoodRx variants require committing the combobox value.
     try:
         await zip_input.press("Enter")
@@ -860,80 +906,142 @@ async def scrape_drug_data(page, drug_name, zip_code):
     except Exception as exc:
         await save_dom_artifact(page, drug_name, zip_code, "results_not_found")
         raise ResultsNotFoundError("Pharmacy rows did not appear after setting location.") from exc
-    await human_delay(3, 5)
+    lo, hi = DELAY_POST_RESULTS_VISIBLE_S
+    await asyncio.sleep(random.uniform(lo, hi))
     print("    Phase: result rows on page; reading pharmacy rows")
     
     results_count = 0
     row_skip_count = 0
     row_skip_artifact_saved = False
     candidate_count = 0
-    for i in range(MAX_ROW_CANDIDATES):
-        if results_count >= MAX_RESULTS_PER_ZIP:
+    duplicate_row_skips = 0
+    seen_row_keys: set = set()
+    seen_row_indices: set[int] = set()
+    skipped_mail_order_count = 0
+    retail_count = 0
+    for scan_pass in range(MAX_ROW_SCAN_PASSES):
+        try:
+            dom_rows = await price_rows_locator.count()
+        except Exception:
+            dom_rows = 0
+        max_idx_this_pass = min(dom_rows, MAX_ROW_CANDIDATES * (scan_pass + 1))
+        if max_idx_this_pass <= 0:
+            continue
+
+        for i in range(max_idx_this_pass):
+            if i in seen_row_indices:
+                continue
+            seen_row_indices.add(i)
+            row = price_rows_locator.nth(i)
+            try:
+                await clear_known_interstitials(page)
+                if not await is_row_candidate(row):
+                    continue
+                candidate_count += 1
+            except Exception:
+                continue
+
+            try:
+                pharmacy_name = await extract_pharmacy_name(row)
+                if not pharmacy_name:
+                    raise ValueError("Pharmacy name not found in row.")
+                if is_mail_order_pharmacy(pharmacy_name):
+                    skipped_mail_order_count += 1
+                    print(f"    [DEBUG] Skipping Delivery/Mail Order: {pharmacy_name.strip()}")
+                    continue
+
+                option_type = "retail_pickup"
+                print(f"    [DEBUG] Found Retail Pharmacy Candidate: {pharmacy_name.strip()}")
+
+                goodrx_price_text = await first_visible_text(
+                    row,
+                    [
+                        '[data-qa="price"]',
+                        '[data-testid*="price"]',
+                        '[class*="price"]',
+                        'text=/\\$\\s?[0-9]/',
+                    ],
+                )
+                if not goodrx_price_text:
+                    row_text = await row.inner_text(timeout=2500)
+                    goodrx_price_text = row_text
+                print(f"    [DEBUG] Raw GoodRx Text: '{goodrx_price_text}'")
+                if not goodrx_price_text:
+                    raise ValueError("GoodRx price not found in row.")
+                goodrx_price = extract_price_with_regex(goodrx_price_text)
+                print(f"    [DEBUG] Regex Extracted GoodRx Price: {goodrx_price}")
+                if goodrx_price is None:
+                    print("    [DEBUG] FAIL: GoodRx price not found via regex. Skipping row.")
+                    raise ValueError("GoodRx price not found via regex.")
+
+                rid = row_identity_key(pharmacy_name, goodrx_price)
+                if rid in seen_row_keys:
+                    duplicate_row_skips += 1
+                    continue
+                seen_row_keys.add(rid)
+
+                # Base fields are primary; retail enrichment is best effort.
+                retail_raw = await maybe_extract_retail_price(
+                    page,
+                    row,
+                    physical_pickup=True,
+                )
+                if retail_raw is None:
+                    retail_price = None
+                elif isinstance(retail_raw, (int, float)):
+                    retail_price = float(retail_raw)
+                else:
+                    retail_price = extract_price_with_regex(str(retail_raw))
+
+                await save_to_csv({
+                    "Date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "Zip_Code": zip_code,
+                    "Drug_Name": drug_name,
+                    "Pharmacy_Name": pharmacy_name.strip(),
+                    "Option_Type": option_type,
+                    "Retail_Price": retail_price or "N/A",
+                    "GoodRx_Price": goodrx_price
+                })
+                results_count += 1
+                retail_count += 1
+                nm = pharmacy_name.strip()
+                if len(nm) > 50:
+                    nm = nm[:47] + "..."
+                rpv = f"${retail_price:.2f}" if retail_price is not None else "N/A"
+                print(
+                    f"    Saved row: {nm} | GoodRx ${goodrx_price:.2f} | retail {rpv}"
+                )
+            except Exception as row_exc:
+                row_skip_count += 1
+                print(f"    Row parse skipped ({type(row_exc).__name__}): {row_exc}")
+                if row_skip_count >= MAX_ROW_SKIP_BEFORE_ARTIFACT and not row_skip_artifact_saved:
+                    await save_dom_artifact(page, drug_name, zip_code, "repeated_row_skip")
+                    row_skip_artifact_saved = True
+                continue
+
+        if scan_pass >= (MAX_ROW_SCAN_PASSES - 1):
             break
-        row = price_rows_locator.nth(i)
         try:
             await clear_known_interstitials(page)
-            if not await is_row_candidate(row):
-                continue
-            candidate_count += 1
+            if max_idx_this_pass > 0:
+                await price_rows_locator.nth(max_idx_this_pass - 1).scroll_into_view_if_needed()
+            await asyncio.sleep(random.uniform(0.5, 1.0))
         except Exception:
-            continue
-            
-        try:
-            pharmacy_name = await extract_pharmacy_name(row)
-            if not pharmacy_name:
-                raise ValueError("Pharmacy name not found in row.")
-
-            goodrx_price_text = await first_visible_text(
-                row,
-                [
-                    '[data-qa="price"]',
-                    '[data-testid*="price"]',
-                    '[class*="price"]',
-                    'text=/\\$\\s?[0-9]/',
-                ],
-            )
-            if not goodrx_price_text:
-                row_text = await row.inner_text(timeout=2500)
-                price_match = re.search(r"\$[0-9,]+(?:\.[0-9]{2})?", row_text)
-                if price_match:
-                    goodrx_price_text = price_match.group(0)
-            if not goodrx_price_text:
-                raise ValueError("GoodRx price not found in row.")
-            goodrx_price = parse_price(goodrx_price_text)
-            
-            # Base fields are primary; retail enrichment is best effort.
-            retail_price = await maybe_extract_retail_price(page, row)
-            
-            await save_to_csv({
-                "Date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "Zip_Code": zip_code,
-                "Drug_Name": drug_name,
-                "Pharmacy_Name": pharmacy_name.strip(),
-                "Retail_Price": retail_price or "N/A",
-                "GoodRx_Price": goodrx_price
-            })
-            results_count += 1
-            nm = pharmacy_name.strip()
-            if len(nm) > 50:
-                nm = nm[:47] + "..."
-            rpv = f"${retail_price:.2f}" if retail_price is not None else "N/A"
-            print(
-                f"    Saved row: {nm} | GoodRx ${goodrx_price:.2f} | retail {rpv}"
-            )
-        except Exception as row_exc:
-            row_skip_count += 1
-            print(f"    Row parse skipped ({type(row_exc).__name__}): {row_exc}")
-            if row_skip_count >= MAX_ROW_SKIP_BEFORE_ARTIFACT and not row_skip_artifact_saved:
-                await save_dom_artifact(page, drug_name, zip_code, "repeated_row_skip")
-                row_skip_artifact_saved = True
-            continue
+            try:
+                await page.mouse.wheel(0, 1000)
+                await asyncio.sleep(random.uniform(0.5, 1.0))
+            except Exception:
+                pass
     if candidate_count > 0 or results_count > 0:
-        # row_skip_count / candidate_count = failure rate; do not read as "rows saved".
-        good = candidate_count - row_skip_count
+        # uniques = DOM candidates minus duplicate cards; good = uniques that did not throw.
+        unique_candidates = candidate_count - duplicate_row_skips
+        good = unique_candidates - row_skip_count
+        dup_part = f"; dup DOM rows skipped: {duplicate_row_skips}" if duplicate_row_skips else ""
+        denom = unique_candidates if unique_candidates > 0 else (candidate_count or 1)
         print(
-            f"    Rows written: {results_count} (max {MAX_RESULTS_PER_ZIP}); "
-            f"candidate rows OK: {good}/{candidate_count} ({row_skip_count} parse failures)"
+            f"    Rows written: {results_count}; "
+            f"candidate rows OK: {good}/{denom} ({row_skip_count} parse failures); "
+            f"mail-order skipped: {skipped_mail_order_count}; retail: {retail_count}{dup_part}"
         )
     else:
         print("    Wrote 0 rows (no row candidates, or all candidates failed to parse).")
@@ -943,17 +1051,28 @@ async def scrape_drug_data(page, drug_name, zip_code):
     )
 
 async def main():
+    global _run_csv_path
     if not os.path.exists(SCREENSHOT_DIR): os.makedirs(SCREENSHOT_DIR)
     if not os.path.exists(USER_DATA_DIR): os.makedirs(USER_DATA_DIR)
     if not os.path.exists(DOM_ARTIFACT_DIR): os.makedirs(DOM_ARTIFACT_DIR)
+    if not os.path.exists(RUNS_DIR):
+        os.makedirs(RUNS_DIR)
+    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+    _run_csv_path = os.path.join(RUNS_DIR, f"prices_{run_id}.csv")
+    print(
+        f"Run output (this scrape only, timestamped): {os.path.abspath(_run_csv_path)}"
+    )
+    with open(_run_csv_path, "w", newline="", encoding="utf-8") as f:
+        csv.DictWriter(f, fieldnames=OUTPUT_FIELDNAMES).writeheader()
     await cleanup_old_dom_artifacts()
-        
+
     async with Stealth().use_async(async_playwright()) as p:
         # Use Persistent Context to warm up the session
         context = await p.chromium.launch_persistent_context(
             user_data_dir=os.path.abspath(USER_DATA_DIR),
             headless=False,
             user_agent=USER_AGENT,
+            # Force desktop side-by-side layout to avoid mobile accordion UI.
             viewport={"width": 1920, "height": 1080},
             args=[
                 "--disable-blink-features=AutomationControlled",
@@ -966,9 +1085,11 @@ async def main():
             print(f"Starting drug: {drug['name']}")
             try:
                 await page.goto("https://www.google.com/", wait_until="domcontentloaded")
-                await human_delay(1, 2)
+                g0, g1 = DELAY_WARMUP_GOOGLE_S
+                await asyncio.sleep(random.uniform(g0, g1))
                 await page.goto(drug["url"], wait_until="domcontentloaded", timeout=60000)
-                await human_delay(4, 6)
+                d0, d1 = DELAY_POST_DRUG_LOAD_S
+                await asyncio.sleep(random.uniform(d0, d1))
                 
                 for zip_code in ZIP_CODES:
                     zip_completed = False
@@ -978,7 +1099,8 @@ async def main():
                                 scrape_drug_data(page, drug["name"], zip_code),
                                 timeout=ZIP_ATTEMPT_BUDGET_SEC,
                             )
-                            await human_delay(5, 10)
+                            b0, b1 = DELAY_BETWEEN_ZIPS_S
+                            await asyncio.sleep(random.uniform(b0, b1))
                             zip_completed = True
                             break
                         except Exception as e:
@@ -995,14 +1117,28 @@ async def main():
                             if last_attempt:
                                 break
                             await page.goto(drug["url"], wait_until="domcontentloaded")
-                            await human_delay(3, 5)
+                            r0, r1 = DELAY_ON_ZIP_RETRY_S
+                            await asyncio.sleep(random.uniform(r0, r1))
                     if not zip_completed:
                         print(f"  Skipping {drug['name']} {zip_code} after {MAX_ZIP_RETRIES + 1} failed attempts.")
             except Exception as e:
                 print(f"CRITICAL: {e}")
                 
         await context.close()
-        print("Scraping complete.")
+    print("Scraping complete.")
+    if _run_csv_path and os.path.isfile(_run_csv_path):
+        ap = os.path.abspath(_run_csv_path)
+        try:
+            with open(_run_csv_path, encoding="utf-8") as cf:
+                row_count = max(sum(1 for _ in cf) - 1, 0)  # minus header
+        except OSError:
+            row_count = -1
+        if row_count >= 0:
+            print(f"Run CSV: {ap} ({row_count} data rows)")
+        else:
+            print(f"Run CSV: {ap}")
+    elif _run_csv_path:
+        print(f"Run CSV was set but file missing: {_run_csv_path}")
 
 if __name__ == "__main__":
     try:

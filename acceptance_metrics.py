@@ -6,8 +6,21 @@ from dataclasses import dataclass
 from typing import Optional
 
 
-DEFAULT_CSV = "national_pharmacy_pricing.csv"
+RUNS_DIR = "runs"
+LEGACY_CSV = "national_pharmacy_pricing.csv"  # pre–per-run-snapshots
 DEFAULT_DOM_DIR = "error_dom_artifacts"
+
+
+def resolve_default_csv() -> str:
+    """Prefer newest `runs/prices_*.csv`; else legacy single file if present."""
+    if os.path.isdir(RUNS_DIR):
+        names = [n for n in os.listdir(RUNS_DIR) if n.startswith("prices_") and n.endswith(".csv")]
+        if names:
+            paths = [os.path.join(RUNS_DIR, n) for n in names]
+            return max(paths, key=lambda p: os.path.getmtime(p))
+    if os.path.isfile(LEGACY_CSV):
+        return LEGACY_CSV
+    return os.path.join(RUNS_DIR, "prices_<run_id>.csv")
 
 
 @dataclass
@@ -171,12 +184,20 @@ def main():
     parser = argparse.ArgumentParser(
         description="Evaluate scraper acceptance targets from CSV, DOM artifacts, and optional run logs."
     )
-    parser.add_argument("--csv", default=DEFAULT_CSV, help="Path to pricing CSV")
+    parser.add_argument(
+        "--csv",
+        default=None,
+        help=f"Path to pricing CSV (default: newest in {RUNS_DIR}/, else {LEGACY_CSV} if it exists)",
+    )
     parser.add_argument("--dom-dir", default=DEFAULT_DOM_DIR, help="Path to DOM artifact directory")
     parser.add_argument("--log-file", default=None, help="Optional scraper stdout log file")
     args = parser.parse_args()
+    csv_path = args.csv or resolve_default_csv()
+    if not os.path.isfile(csv_path):
+        print(f"No CSV at {csv_path!r} — run the scraper first (outputs under {RUNS_DIR}/).")
+        return
 
-    results = build_report(args.csv, args.dom_dir, args.log_file)
+    results = build_report(csv_path, args.dom_dir, args.log_file)
     passed = 0
 
     print("Acceptance Metrics")
