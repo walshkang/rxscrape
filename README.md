@@ -43,6 +43,7 @@ The scraper will loop through pre-configured drugs and zip codes, saving the dat
 ## Development
 - `pytest`: Run unit tests for data cleaning logic.
 - `error_screenshots/`: Check this directory for screenshots of any failed extraction attempts for debugging.
+- `python3 acceptance_metrics.py --log-file run.log`: Evaluate acceptance targets after a run.
 
 ## License
 MIT

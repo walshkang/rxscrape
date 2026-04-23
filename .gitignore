@@ -10,6 +10,7 @@ venv/
 __pycache__/
 *.csv
 error_screenshots/
+error_dom_artifacts/
 browser_profile/
 .DS_Store
 sults/

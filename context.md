@@ -8,7 +8,13 @@ The script uses Playwright with stealth behavior and human-like interaction patt
 
 ## Current Architecture
 
-Single-file workflow in `scraper.py`:
+Main runtime workflow lives in `scraper.py`, with parsing helpers and tests in separate files:
+
+- `scraper.py`: browser automation, ZIP iteration, modal/captcha handling, row extraction, CSV append.
+- `scraper_utils.py`: normalization utilities like `parse_price`.
+- `tests/test_scraper.py`: unit tests for price parsing behavior.
+
+Runtime flow in `scraper.py`:
 
 1. Launch persistent Chromium context (`browser_profile`) with stealth.
 2. For each drug URL:
@@ -23,6 +29,23 @@ Single-file workflow in `scraper.py`:
    - take screenshot in `error_screenshots/`
    - log structured failure line
    - reload drug URL and continue
+
+## Configuration At A Glance
+
+Primary runtime configuration is defined at the top of `scraper.py`:
+
+- `DRUGS`: fixed list of drug pages to scrape.
+- `ZIP_CODES`: fixed ZIP sample set to iterate.
+- `CSV_FILE`: output path (`national_pharmacy_pricing.csv`).
+- `SCREENSHOT_DIR`: failure artifact directory (`error_screenshots`).
+- `USER_DATA_DIR`: persistent Chromium profile directory (`browser_profile`).
+- `LOCATION_TRIGGER_RE`: regex used to locate location trigger variants.
+
+Current runtime defaults in code:
+
+- Browser mode: headed (`headless=False`) with persistent profile.
+- Per ZIP extraction target: up to 3 parsed rows (`results_count >= 3` stop condition).
+- Candidate scan window: first 10 row candidates per ZIP.
 
 ## Key Components
 
@@ -83,27 +106,54 @@ Major blocker categories have shifted from initial strict-mode failures to downs
 1. **Overlay-aware parsing**
    - Detect and close `savings-tip-row-modal` before iterating rows.
    - Skip row click actions while blocking overlay is present.
+   - Acceptance target: 0 unhandled overlay-intercept failures across 50 ZIP iterations.
 
 2. **Tighten row candidate selection**
    - Exclude container sections and target only leaf row cards.
    - Add explicit `is_row_candidate` guard before parsing.
+   - Acceptance target: row-parse skip rate under 10% across first 10 candidates on a 3-drug x 5-ZIP run.
 
 3. **Decouple retail-price enrichment from main parse**
    - Save GoodRx price/name without row click dependency.
    - Attempt retail enrichment only when safe and non-blocked.
+   - Acceptance target: base fields (`Pharmacy_Name`, `GoodRx_Price`) populated for at least 95% of saved rows; retail enrichment best-effort at 70%+ without reducing base completion.
 
 4. **Add debug artifacts for failed ZIP parses**
    - On `ResultsNotFoundError` or repeated row skip, persist a small DOM snapshot artifact for selector tuning.
+   - Acceptance target: 100% artifact capture for qualifying failures, with timestamped files and 14-day local retention.
 
 5. **Keep retry behavior bounded**
    - Preserve per-zip retries and continue-on-failure to avoid full-run stalls.
+   - Acceptance target: max 2 retries per ZIP and a per-zip asyncio budget (`ZIP_ATTEMPT_BUDGET_SEC` in `scraper.py`) before fail-and-continue.
+
+## Flow Overview
+
+```mermaid
+flowchart TD
+    startRun[StartRun] --> launchCtx[LaunchPersistentContext]
+    launchCtx --> drugLoop[LoopDrugs]
+    drugLoop --> zipLoop[LoopZips]
+    zipLoop --> captchaCheck[CheckAndClearCaptcha]
+    captchaCheck --> setLocation[OpenLocationModalAndSetZip]
+    setLocation --> rowsReady[WaitForPharmacyRows]
+    rowsReady --> parseRows[ParseTopRows]
+    parseRows --> saveCsv[AppendNormalizedCsvRows]
+    saveCsv --> zipDone[ZipDone]
+    zipDone --> zipLoop
+    zipLoop -->|PerZipFailure| failShot[SaveFailureScreenshot]
+    failShot --> reloadDrug[ReloadDrugPage]
+    reloadDrug --> zipLoop
+    zipLoop --> drugLoop
+    drugLoop --> endRun[EndRun]
+```
 
 ## Operational Notes
 
-- Run command:
-  - `venv/bin/python scraper.py`
-- Playwright browsers may need install in fresh environments:
-  - `venv/bin/python -m playwright install chromium --force`
+- Canonical install/run steps live in `README.md` (use that as source of truth).
+- Quick run (inside activated venv): `python3 scraper.py`
+- Browser install (fresh environment): `playwright install chromium`
+- Runtime stack: Playwright + `playwright-stealth` (version pins in `requirements.txt`).
+- Current default is headed mode for stability debugging (`headless=False`); switch only with explicit validation in anti-bot/captcha conditions.
 - Persistent profile lock can require killing stale Chromium processes using `browser_profile`.
 
 ## Data Outputs
