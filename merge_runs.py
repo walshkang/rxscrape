@@ -11,7 +11,16 @@ import os
 import re
 
 # Keep in sync with scraper.OUTPUT_FIELDNAMES
-BASE_FIELDS = ["Date", "Zip_Code", "Drug_Name", "Pharmacy_Name", "Retail_Price", "GoodRx_Price"]
+BASE_FIELDS = [
+    "Date",
+    "Zip_Code",
+    "Drug_Name",
+    "Pharmacy_Name",
+    "Option_Type",
+    "Retail_Price",
+    "Retail_Flag",
+    "GoodRx_Price",
+]
 OUT_FIELDS = ["Run_ID"] + BASE_FIELDS
 
 PRICES_PATTERN = re.compile(r"^prices_\d{8}_\d{6}\.csv$")

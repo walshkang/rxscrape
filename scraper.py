@@ -45,6 +45,7 @@ OUTPUT_FIELDNAMES = [
     "Pharmacy_Name",
     "Option_Type",
     "Retail_Price",
+    "Retail_Flag",
     "GoodRx_Price",
 ]
 _run_csv_path: str | None = None
@@ -485,6 +486,82 @@ async def cleanup_old_dom_artifacts(retention_days: int = DOM_ARTIFACT_RETENTION
             continue
 
 
+async def snapshot_retail_debug_modal_text(page) -> str:
+    """Visible non-location dialog text (coupon / price detail) for forensics. Truncated."""
+    chunks: list[str] = []
+    try:
+        dlog = page.locator('[role="dialog"]')
+        n = await dlog.count()
+        for i in range(min(n, 4)):
+            el = dlog.nth(i)
+            try:
+                if not await el.is_visible():
+                    continue
+            except Exception:
+                continue
+            try:
+                tid = (await el.get_attribute("data-testid") or "")
+                eid = (await el.get_attribute("id") or "")
+                if re.search(r"location", tid, re.I) or eid == "locationModal":
+                    continue
+            except Exception:
+                pass
+            try:
+                t = (await el.inner_text(timeout=2500) or "").strip()
+                if t:
+                    chunks.append(t[:6000])
+            except Exception:
+                pass
+    except Exception:
+        pass
+    if not chunks:
+        return ""
+    return "\n---\n".join(chunks)[:10000]
+
+
+async def log_retail_suspicious_artifact(
+    page,
+    drug_name: str,
+    zip_code: str,
+    pharmacy_name: str,
+    goodrx: float,
+    retail: float,
+    modal_text: str,
+) -> None:
+    """When retail < GoodRx, save modal text + full-page screenshot for manual review."""
+    os.makedirs(DOM_ARTIFACT_DIR, exist_ok=True)
+    os.makedirs(SCREENSHOT_DIR, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    base = (
+        f"retail_susp_{sanitize_name(drug_name)}_{zip_code}_"
+        f"{sanitize_name(pharmacy_name)[:80]}_{ts}"
+    )
+    path_txt = os.path.join(DOM_ARTIFACT_DIR, f"{base}.txt")
+    try:
+        with open(path_txt, "w", encoding="utf-8") as f:
+            f.write(f"url: {page.url}\n")
+            f.write(
+                f"drug={drug_name!r} zip={zip_code!r} pharmacy={pharmacy_name!r}\n"
+            )
+            f.write(
+                f"GoodRx={goodrx} retail={retail} (retail < GoodRx — worth verifying)\n\n"
+            )
+            f.write("--- visible non-location dialog text (captured before popup close) ---\n")
+            f.write((modal_text or "(none)").strip() + "\n")
+            f.write(
+                "\n(Page PNG is full_page after the coupon was closed.)\n"
+            )
+        print(f"    [Retail check] {path_txt}")
+    except Exception as exc:
+        print(f"    [Retail check] could not write text artifact: {exc}")
+    try:
+        path_png = os.path.join(SCREENSHOT_DIR, f"{base}.png")
+        await page.screenshot(path=path_png, full_page=True)
+        print(f"    [Retail check] {path_png}")
+    except Exception as exc:
+        print(f"    [Retail check] screenshot failed: {exc}")
+
+
 async def save_dom_artifact(page, drug_name: str, zip_code: str, reason: str):
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     safe_drug = sanitize_name(drug_name)
@@ -615,8 +692,13 @@ async def close_price_detail_popup(page, max_passes: int = 3):
         '[data-testid*="modal"][data-state="open"], '
         '[data-qa*="modal"][data-state="open"]'
     )
-    # Keep this targeted to price-detail surfaces so we avoid closing location modal.
-    price_heading = page.get_by_text(re.compile(r"Buy online|Mail order price|Continue to", re.I))
+    # Coupon detail (incl. stricken “Retail price”) — not the ZIP location dialog.
+    price_heading = page.get_by_text(
+        re.compile(
+            r"Buy online|Mail order price|GoodRx|Retail price|\bBIN\b|Member ID|Continue to|Press\s*&\s*Hold",
+            re.I,
+        )
+    )
     for _ in range(max_passes):
         visible = False
         try:
@@ -669,13 +751,60 @@ async def is_row_candidate(row):
     return has_price and has_name
 
 
+# Digits for a list / retail / cash / was amount (0–2 decimal places, optional cents).
+_RETAIL_DOLLAR_AMT = r"[0-9,]+(?:\.[0-9]{1,2})?"
+
+# Label in text, then (within a window) a dollar — handles line breaks, colons, “Retail price”.
+RETAIL_LABELED_PRICE_RE = re.compile(
+    r"(?is)(?:"
+    r"retail(?:\s+price)?\b(?!\s+sa)"
+    r"|est\.?\s*retail\b"
+    r"|typical\s+retail\b"
+    r"|suggested\s+retail\b"
+    r"|list\s+price\b"
+    r"|original\s+price\b"
+    r"|full\s+price\b"
+    r"|cash\s+price\b"
+    r"|compare\s*at"
+    r"|\bmsrp\b"
+    r")\s*[:#]?"
+    r".{0,140}?"
+    rf"\$({_RETAIL_DOLLAR_AMT})"
+)
+
+# “Was $12.34” (list / crossed-out) — line or same blob.
+WAS_DOLLAR_PRICE_RE = re.compile(
+    rf"(?i)(?:^|[\n\r]|\b)was\s+\$({_RETAIL_DOLLAR_AMT})\b"
+)
+WAS_DOLLAR_PRICE_INLINE_RE = re.compile(rf"(?i)\bwas:\s*\$({_RETAIL_DOLLAR_AMT})")
+
+
+def _float_from_captured_dollar_string(m: re.Match[str], group: int = 1) -> float | None:
+    if not m:
+        return None
+    raw = m.group(group)
+    return extract_price_with_regex(f"${raw}")
+
+
 def extract_retail_from_blurb(text: str):
-    """Pull a retail / cash / list / was price from a row or modal text blob."""
+    """Pull a retail / cash / list / was price from a row or modal text blob (regex + line scan)."""
     if not text or not text.strip():
         return None
+
+    m = RETAIL_LABELED_PRICE_RE.search(text)
+    if m:
+        v = _float_from_captured_dollar_string(m, 1)
+        if v is not None:
+            return v
+    m = WAS_DOLLAR_PRICE_RE.search(text) or WAS_DOLLAR_PRICE_INLINE_RE.search(text)
+    if m:
+        v = _float_from_captured_dollar_string(m, 1)
+        if v is not None:
+            return v
+
     line_keywords = re.compile(
         r"(?i)retail(\s+price)?\b|est\.?\s*retail|"
-        r"cash(\s+price)?\b|original\s+price|list\s+price|"
+        r"cash\s+price\b|original\s+price|list\s+price|"
         r"^was\s+\$|typical\s+retail|full\s+price"
     )
     for line in text.splitlines():
@@ -686,21 +815,142 @@ def extract_retail_from_blurb(text: str):
             parsed = extract_price_with_regex(t)
             if parsed is not None:
                 return parsed
+
     for pat in (
-        r"(?i)retail[^$\n]{0,48}\$[0-9,]+\.[0-9]{2}",
-        r"(?i)est\.?\s*retail[^$\n]{0,48}\$[0-9,]+\.[0-9]{2}",
-        r"(?i)typical\s+retail[^$\n]{0,48}\$[0-9,]+\.[0-9]{2}",
-        r"(?i)was\s+\$[0-9,]+\.[0-9]{2}",
+        rf"(?i)retail[^$\n]{{0,48}}\$({_RETAIL_DOLLAR_AMT})\b",
+        rf"(?i)est\.?\s*retail[^$\n]{{0,48}}\$({_RETAIL_DOLLAR_AMT})\b",
+        rf"(?i)typical\s+retail[^$\n]{{0,48}}\$({_RETAIL_DOLLAR_AMT})\b",
+        rf"(?i)was\s+\$({_RETAIL_DOLLAR_AMT})\b",
     ):
-        m = re.search(pat, text)
-        if m:
-            parsed = extract_price_with_regex(m.group(0))
-            if parsed is not None:
-                return parsed
+        m2 = re.search(pat, text)
+        if m2:
+            v = _float_from_captured_dollar_string(m2, 1)
+            if v is not None:
+                return v
     return None
 
 
-async def maybe_extract_retail_price(page, row, physical_pickup: bool):
+# After opening a pharmacy row, the coupon often shows “Retail price:” with the list amount
+# in <s>/<del>, via CSS line-through, and/or as muted gray text — not always semantic <s> tags.
+_STRIKETHROUGH_RETAIL_IN_MODAL_JS = r"""
+() => {
+    const isRetail = (s) => /retail|est\.\s*retail|list\s+price|typical|msrp|suggested|compare\s*at|was|cash\s+price/i.test(s);
+    const pickFirst = (s) => {
+        const m = (s || "").match(/\$([0-9,]+(?:\.[0-9]{1,2})?)/);
+        if (!m) return null;
+        const v = parseFloat(m[1].replace(/,/g, ""));
+        if (Number.isNaN(v) || v <= 0) return null;
+        return v;
+    };
+    const isLocModal = (d) => {
+        if (!d) return true;
+        if (/location/i.test(d.getAttribute("data-testid") || "")) return true;
+        if (d.getAttribute("id") === "locationModal") return true;
+        return false;
+    };
+    const hasRetailAncestor = (el, maxH) => {
+        let p = el;
+        for (let i = 0; i < maxH && p; i++) {
+            if (isRetail(p.textContent || "")) return true;
+            p = p.parentElement;
+        }
+        return false;
+    };
+    const isStruckTag = (el) => {
+        const t = (el && el.tagName) || "";
+        return t === "S" || t === "DEL" || t === "STRIKE";
+    };
+    const isLineThroughComputed = (el) => {
+        if (!el || el.nodeType !== 1) return false;
+        try {
+            const st = getComputedStyle(el);
+            const t = (st.textDecorationLine || "") + " " + (st.textDecoration || "");
+            return t.indexOf("line-through") >= 0;
+        } catch (e) {
+            return false;
+        }
+    };
+    /** GoodRx often applies strikethrough via CSS on a wrapper; walk up a few levels. */
+    const isStruckOrAncestor = (el, maxH) => {
+        let p = el;
+        for (let i = 0; i < maxH && p; p = p.parentElement, i++) {
+            if (isStruckTag(p) || isLineThroughComputed(p)) return true;
+        }
+        return false;
+    };
+    const isGrayish = (el) => {
+        if (!el || el.nodeType !== 1) return false;
+        try {
+            const c = getComputedStyle(el).color;
+            const m = c.match(/rgba?\s*\(\s*(\d+)[\s,]+(\d+)[\s,]+(\d+)/);
+            if (!m) return false;
+            const r = +m[1], g = +m[2], b = +m[3];
+            if (Math.max(r, g, b) - Math.min(r, g, b) > 60) return false;
+            const avg = (r + g + b) / 3;
+            return avg > 75 && avg < 220;
+        } catch (e) {
+            return false;
+        }
+    };
+    const tryPriceWithRetail = (el) => {
+        const raw = (el.textContent || "").replace(/\s+/g, " ").trim();
+        if (!/\$[0-9,]+/.test(raw)) return null;
+        if (!hasRetailAncestor(el, 7)) return null;
+        return pickFirst(raw);
+    };
+    const roots = [];
+    for (const d of document.querySelectorAll('[role="dialog"]')) {
+        if (d.getClientRects().length === 0) continue;
+        if (isLocModal(d)) continue;
+        roots.push(d);
+    }
+    if (roots.length === 0) roots.push(document.body);
+    const walkSelector = "span, div, p, li, em, small, s, del, strike, label, a, b, i, u, font, h2, h3, h4";
+    for (const root of roots) {
+        for (const el of root.querySelectorAll("s, del, strike")) {
+            if (el.getClientRects().length === 0) continue;
+            const v = tryPriceWithRetail(el);
+            if (v != null) return v;
+        }
+        for (const el of root.querySelectorAll(walkSelector)) {
+            if (el.getClientRects().length === 0) continue;
+            if (!isStruckOrAncestor(el, 4)) continue;
+            const v = tryPriceWithRetail(el);
+            if (v != null) return v;
+        }
+        for (const el of root.querySelectorAll(walkSelector)) {
+            if (el.getClientRects().length === 0) continue;
+            if (!isGrayish(el)) continue;
+            const raw = (el.textContent || "").replace(/\s+/g, " ").trim();
+            if (raw.length > 36) continue;
+            if (!hasRetailAncestor(el, 7)) continue;
+            const v = pickFirst(raw);
+            if (v != null) return v;
+        }
+    }
+    return null;
+}
+"""
+
+
+async def try_extract_strikethrough_retail_in_open_modal(page) -> float | None:
+    """List / retail price from the open coupon: <s>/<del>, CSS line-through, or short gray $ text near a retail label."""
+    try:
+        v = await page.evaluate(_STRIKETHROUGH_RETAIL_IN_MODAL_JS)
+        if v is not None and isinstance(v, (int, float)) and v > 0:
+            return float(v)
+    except Exception:
+        pass
+    return None
+
+
+async def maybe_extract_retail_price(
+    page, row, physical_pickup: bool
+) -> tuple[float | None, str | None]:
+    """
+    (retail price or None, optional plain-text dump of the open price/coupon dialog).
+    The dialog text is only captured for physical_pickup (after row click), before the popup is closed.
+    """
     # Scroll so sticky footers and bottom price rows (retail) are in the layout viewport.
     try:
         await row.scroll_into_view_if_needed()
@@ -713,7 +963,7 @@ async def maybe_extract_retail_price(page, row, physical_pickup: bool):
             blob = (await row.inner_text(timeout=3000)) or ""
             got = extract_retail_from_blurb(blob)
             if got is not None:
-                return got
+                return got, None
         except Exception:
             pass
 
@@ -734,8 +984,8 @@ async def maybe_extract_retail_price(page, row, physical_pickup: bool):
         if retail_text:
             parsed = extract_price_with_regex(retail_text)
             if parsed is not None:
-                return parsed
-        return None
+                return parsed, None
+        return None, None
 
     await clear_known_interstitials(page)
     overlay_ok = await clear_savings_tip_overlay(page)
@@ -750,6 +1000,8 @@ async def maybe_extract_retail_price(page, row, physical_pickup: bool):
     # Still attempt detail click: force helps when a translucent overlay claims visibility but row is tappable.
     use_force = not overlay_ok
 
+    result: float | None = None
+    modal_debug: str | None = None
     try:
         try:
             await row.scroll_into_view_if_needed()
@@ -762,48 +1014,66 @@ async def maybe_extract_retail_price(page, row, physical_pickup: bool):
             await row.click(timeout=3000, force=True)
         await asyncio.sleep(random.uniform(1.0, 2.0))
 
-        main_retail_text = await first_visible_text(
-            page,
-            [
-                'text=/Retail:?\\s*\\$[0-9]/i',
-                'text=/Retail:?/i',
-                '[data-qa*="retail"]',
-                '[data-testid*="retail"]',
-            ],
-            timeout_ms=3500,
-        )
-        if main_retail_text:
-            parsed = extract_retail_from_blurb(main_retail_text)
-            if parsed is not None:
-                return parsed
-            parsed = extract_price_with_regex(main_retail_text)
-            if parsed is not None:
-                return parsed
+        st = await try_extract_strikethrough_retail_in_open_modal(page)
+        if st is not None:
+            result = st
+        else:
+            main_retail_text = await first_visible_text(
+                page,
+                [
+                    'text=/Retail:?\\s*\\$[0-9]/i',
+                    'text=/Retail:?/i',
+                    '[data-qa*="retail"]',
+                    '[data-testid*="retail"]',
+                ],
+                timeout_ms=3500,
+            )
+            if main_retail_text:
+                p1 = extract_retail_from_blurb(main_retail_text)
+                p2 = extract_price_with_regex(main_retail_text) if p1 is None else None
+                if p1 is not None:
+                    result = p1
+                elif p2 is not None:
+                    result = p2
 
-        for loc in (
-            page.get_by_text(re.compile(r"Retail:?\s*\$[0-9,]+\.[0-9]{2}", re.I)),
-            page.get_by_text(re.compile(r"Est\.?\s*retail:?\s*\$", re.I)),
-            page.get_by_text(re.compile(r"Typical\s+retail:?\s*\$", re.I)),
-        ):
-            try:
-                if await loc.count() == 0:
+        if result is None:
+            for loc in (
+                page.get_by_text(
+                    re.compile(
+                        rf"Retail:?\s*\${_RETAIL_DOLLAR_AMT}\b", re.I
+                    )
+                ),
+                page.get_by_text(re.compile(r"Est\.?\s*retail:?\s*\$", re.I)),
+                page.get_by_text(re.compile(r"Typical\s+retail:?\s*\$", re.I)),
+            ):
+                try:
+                    if await loc.count() == 0:
+                        continue
+                    t = (await loc.first.inner_text(timeout=2000)).strip()
+                    if t:
+                        parsed = extract_retail_from_blurb(t) or extract_price_with_regex(
+                            t
+                        )
+                        if parsed is not None:
+                            result = parsed
+                            break
+                except Exception:
                     continue
-                t = (await loc.first.inner_text(timeout=2000)).strip()
-                if t:
-                    parsed = extract_price_with_regex(t)
-                    if parsed is not None:
-                        return parsed
-            except Exception:
-                continue
-
-        return None
     except Exception:
-        return None
+        result = None
     finally:
+        if physical_pickup:
+            try:
+                t = await snapshot_retail_debug_modal_text(page)
+                if t and t.strip():
+                    modal_debug = t[:12000]
+            except Exception:
+                pass
         try:
             await close_price_detail_popup(page)
         except Exception:
             pass
+    return result, modal_debug
 
 async def scrape_drug_data(page, drug_name, zip_code):
     """Scrapes discoverable pharmacy options for a drug/zip."""
@@ -1055,7 +1325,7 @@ async def scrape_drug_data(page, drug_name, zip_code):
                 seen_row_keys.add(rid)
 
                 # Base fields are primary; retail enrichment is best effort.
-                retail_raw = await maybe_extract_retail_price(
+                retail_raw, retail_modal_debug = await maybe_extract_retail_price(
                     page,
                     row,
                     physical_pickup=True,
@@ -1067,6 +1337,27 @@ async def scrape_drug_data(page, drug_name, zip_code):
                 else:
                     retail_price = extract_price_with_regex(str(retail_raw))
 
+                retail_flag = ""
+                if (
+                    retail_price is not None
+                    and goodrx_price is not None
+                    and retail_price < goodrx_price - 1e-6
+                ):
+                    retail_flag = "suspicious_retail_lt_goodrx"
+                    print(
+                        f"    [Retail check] retail ${retail_price:.2f} < "
+                        f"GoodRx ${goodrx_price:.2f} — saving text + screenshot"
+                    )
+                    await log_retail_suspicious_artifact(
+                        page,
+                        drug_name,
+                        zip_code,
+                        pharmacy_name.strip(),
+                        goodrx_price,
+                        retail_price,
+                        retail_modal_debug or "",
+                    )
+
                 await save_to_csv({
                     "Date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                     "Zip_Code": zip_code,
@@ -1074,7 +1365,8 @@ async def scrape_drug_data(page, drug_name, zip_code):
                     "Pharmacy_Name": pharmacy_name.strip(),
                     "Option_Type": option_type,
                     "Retail_Price": retail_price or "N/A",
-                    "GoodRx_Price": goodrx_price
+                    "Retail_Flag": retail_flag,
+                    "GoodRx_Price": goodrx_price,
                 })
                 results_count += 1
                 retail_count += 1

@@ -2,3 +2,4 @@ playwright
 playwright-stealth
 pytest
 pandas
+requests
