@@ -12,8 +12,29 @@ from playwright_stealth import Stealth
 # Configuration
 DRUGS = [
     {"name": "Atorvastatin", "url": "https://www.goodrx.com/atorvastatin"},
+    {"name": "Amoxicillin", "url": "https://www.goodrx.com/amoxicillin"},
+    {"name": "Imatinib", "url": "https://www.goodrx.com/imatinib"},
 ]
-ZIP_CODES = ['10012']
+# Representative metros across NY, CA, MI, TX, SD (national spread; not exhaustive).
+ZIP_CODES = [
+    # New York
+    "10001",
+    "11211",
+    # California
+    "90012",
+    "94102",
+    "90210",
+    # Michigan
+    "48201",
+    "49503",
+    # Texas
+    "77002",
+    "75201",
+    "78701",
+    # South Dakota
+    "57104",
+    "57701",
+]
 USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 # One snapshot file per `main()` run (prices change over time; do not mix runs in one file).
 RUNS_DIR = "runs"
@@ -41,6 +62,9 @@ ZIP_ATTEMPT_BUDGET_SEC = 360
 DOM_ARTIFACT_RETENTION_DAYS = 14
 CAPTCHA_MAX_SOLVE_ATTEMPTS = 3
 CAPTCHA_RECHECK_WAIT_SEC = 2.0
+# GoodRx splits local pickup vs mail-order: retail is under the main list; "Home delivery" rows
+# live in a separate region (see data-qa on the mail-order container in the live DOM).
+MAIL_ORDER_PHARMACY_ROWS_CONTAINER_QA = "mail-order-pharmacy-rows-container"
 # Tunable pacing (seconds, min–max). Shorter = faster; too low may look bot-like or race the UI.
 DELAY_POST_DRUG_LOAD_S = (2.0, 3.5)  # after drug URL; was ~4–6s
 DELAY_POST_RESULTS_VISIBLE_S = (1.0, 1.8)  # after pharmacy rows first visible; was ~3–5s
@@ -112,7 +136,7 @@ GENERIC_PHARMACY_LABEL_RE = re.compile(
 MAIL_ORDER_PHARMACY_RE = re.compile(
     # Only classify true mail-order labels/providers; allow local chains with delivery promos.
     r"(?i)^home\s*delivery$|^free\s*shipping$|^mail\s*order$|^ship(?:ping)?\s*to\s*home$|^buy\s*online$|"
-    r"\bdirx\b|\bcost\s*plus\b|\bgeniusrx\b|\bhealthwarehouse\b"
+    r"\bdirx\b|\bcost\s*plus\b|\bgeniusrx\b|\bhealthwarehouse\b|\bgoodrx\s*home\s*delivery\b"
 )
 
 
@@ -140,6 +164,25 @@ def extract_price_with_regex(text: str) -> float | None:
         except ValueError:
             return None
     return None
+
+
+def local_pharmacy_price_rows_locator(page):
+    """
+    Locator for in-store / local pickup price rows only.
+
+    GoodRx puts mail-order offers in data-qa="mail-order-pharmacy-rows-container" (the
+    "Home delivery" block below the local pharmacy list). A broad CSS match on pharmacy+row
+    also hits that container, so we exclude it with XPath not(ancestor::...).
+    """
+    q = MAIL_ORDER_PHARMACY_ROWS_CONTAINER_QA
+    return page.locator(
+        f"xpath=//button[.//*[@data-qa=\"seller-name\"]][not(ancestor::*[@data-qa=\"{q}\"])]"
+        f" | //a[.//*[@data-qa=\"seller-name\"]][not(ancestor::*[@data-qa=\"{q}\"])]"
+        f" | //div[@data-qa=\"pharmacy-row\"][not(ancestor::*[@data-qa=\"{q}\"])]"
+        f" | //*[contains(@class, \"priceRow\")][not(ancestor::*[@data-qa=\"{q}\"])]"
+        f" | //*[@data-testid and contains(@data-testid, \"pharmacy\") and contains(@data-testid, \"row\")]"
+        f"[not(ancestor::*[@data-qa=\"{q}\"])]"
+    )
 
 
 async def _first_plausible_n(row, sel: str, timeout_ms: int = 2500):
@@ -170,6 +213,7 @@ async def extract_pharmacy_name(row):
     marketing (e.g. 'Included with GoodRx Gold') that often wins generic strong/h4.
     """
     for sel in (
+        '[data-qa="seller-name"]',
         'a[href*="/pharmacy/"]',
         '[data-qa*="pharmacy"] h2, [data-qa*="pharmacy"] h3, [data-qa*="pharmacy"] h4, [data-qa*="pharmacy"] h5',
         '[data-testid*="pharmacy"] h2, [data-testid*="pharmacy"] h3, [data-testid*="pharmacy"] h4, [data-testid*="pharmacy"] h5',
@@ -198,7 +242,6 @@ async def extract_pharmacy_name(row):
         t = line.strip()
         if not t:
             continue
-        # Drop price lines; let is_plausible_pharmacy_name handle marketing.
         if re.search(r"\$[0-9]", t):
             continue
         if GENERIC_PHARMACY_LABEL_RE.search(t):
@@ -615,10 +658,10 @@ async def close_price_detail_popup(page, max_passes: int = 3):
 async def is_row_candidate(row):
     if not await row.is_visible():
         return False
-    nested_rows = row.locator('div[data-qa="pharmacy-row"], [class*="priceRow"]')
-    if await nested_rows.count() > 0:
+    try:
+        row_text = (await row.inner_text(timeout=2500)).strip()
+    except Exception:
         return False
-    row_text = (await row.inner_text(timeout=2500)).strip()
     if not row_text:
         return False
     has_price = bool(re.search(r"\$[0-9,]+(?:\.[0-9]{2})?", row_text))
@@ -893,10 +936,7 @@ async def scrape_drug_data(page, drug_name, zip_code):
 
     if not modal_closed:
         # Treat visible pharmacy rows as implicit success when modal state is flaky.
-        rows_probe = page.locator(
-            'div[data-qa="pharmacy-row"], [class*="priceRow"], '
-            '[data-testid*="pharmacy"][data-testid*="row"], [data-qa*="pharmacy"][data-qa*="row"]'
-        )
+        rows_probe = local_pharmacy_price_rows_locator(page)
         try:
             await expect(rows_probe.first).to_be_visible(timeout=5000)
         except Exception as exc:
@@ -904,10 +944,7 @@ async def scrape_drug_data(page, drug_name, zip_code):
     await check_and_handle_captcha(page)
     await clear_known_interstitials(page)
     
-    price_rows_locator = page.locator(
-        'div[data-qa="pharmacy-row"], [class*="priceRow"], '
-        '[data-testid*="pharmacy"][data-testid*="row"], [data-qa*="pharmacy"][data-qa*="row"]'
-    )
+    price_rows_locator = local_pharmacy_price_rows_locator(page)
     try:
         await expect(price_rows_locator.first).to_be_visible(timeout=25000)
     except Exception as exc:
@@ -992,6 +1029,7 @@ async def scrape_drug_data(page, drug_name, zip_code):
                 goodrx_price_text = await first_visible_text(
                     row,
                     [
+                        '[data-qa="seller-price"]',
                         '[data-qa="price"]',
                         '[data-testid*="price"]',
                         '[class*="price"]',
