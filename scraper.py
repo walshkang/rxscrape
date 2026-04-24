@@ -5,6 +5,7 @@ import os
 import random
 import shutil
 import re
+import sys
 import time
 from datetime import datetime, timedelta
 from playwright.async_api import (
@@ -18,10 +19,15 @@ from playwright_stealth import Stealth
 # Configuration
 DRUGS = [
     {"name": "Atorvastatin", "url": "https://www.goodrx.com/atorvastatin"},
+    {"name": "Amoxicillin", "url": "https://www.goodrx.com/amoxicillin"},
+    {"name": "Imatinib", "url": "https://www.goodrx.com/imatinib"},
 ]
-# Single-ZIP diagnostic run (expand for full national scrapes).
 ZIP_CODES = [
-    "10001",
+    "10012",
+    "90210",
+    "48201",
+    "75024",
+    "57701",
 ]
 USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 # One snapshot file per `main()` run (prices change over time; do not mix runs in one file).
@@ -88,6 +94,7 @@ CONSECUTIVE_ZIP_GIVEUPS_BEFORE_PROFILE_RESET = 3
 # Optional: `http://user:pass@host:port` or `http://host:port` (rotating residential provider URL)
 # Also honors `HTTP_PROXY` if `GOODRX_PLAYWRIGHT_PROXY` is unset.
 GOODRX_PLAYWRIGHT_PROXY = os.environ.get("GOODRX_PLAYWRIGHT_PROXY", "").strip()
+GOODRX_MANUAL_PERIMETERX = os.environ.get("GOODRX_MANUAL_PERIMETERX", "").strip().lower()
 # In-app GoodRx embed (overlays the SPA)
 PX_CAPTCHA_IFRAME = "iframe#px-captcha-modal"
 # Full-page "Access to this page has been denied" / px interstitial (see error_dom_artifacts)
@@ -115,6 +122,12 @@ class CaptchaUnresolvedError(ScrapeError):
 
 class CaptchaScriptBlockedError(ScrapeError):
     """captcha.js did not load; PerimeterX rendered the static error UI instead of the real challenge."""
+
+    pass
+
+
+class ManualCaptchaPromptUnavailableError(ScrapeError):
+    """Manual PerimeterX mode requested but stdin is not interactive (TTY)."""
 
     pass
 
@@ -1213,16 +1226,53 @@ async def _captcha_button_locator(
     return None, ""
 
 
+def _manual_perimeterx_mode() -> str:
+    mode = GOODRX_MANUAL_PERIMETERX
+    if mode in ("fallback", "always"):
+        return mode
+    return ""
+
+
+async def _attempt_manual_perimeterx_override(page) -> bool:
+    if not sys.stdin.isatty():
+        raise ManualCaptchaPromptUnavailableError(
+            "GOODRX_MANUAL_PERIMETERX is set, but stdin is not a TTY; refusing to wait for terminal input."
+        )
+    print("\n[manual] PerimeterX challenge detected. Manual override requested.")
+    print("1. Go to the Chromium window.")
+    print("2. Click and hold the challenge button yourself.")
+    print("3. Wait for redirect back to the GoodRx app.")
+    await asyncio.to_thread(
+        input, "👉 Press ENTER here once the GoodRx page has loaded... "
+    )
+    print("    Resuming automation after manual solve...")
+    await _settle_and_wait_for_goodrx_shell_after_captcha_solve(page)
+    if await _pulsing_captcha_solved(page):
+        print("    Manual CAPTCHA override cleared challenge.")
+        return True
+    return False
+
+
 async def check_and_handle_captcha(page, max_attempts: int = CAPTCHA_MAX_SOLVE_ATTEMPTS):
     """Checks for captcha and attempts solve if found."""
     captcha_button_name = re.compile(r"Press & Hold", re.I)
     captcha_text = page.get_by_text(re.compile(r"Before we continue", re.I))
+    manual_mode = _manual_perimeterx_mode()
 
     for attempt in range(max_attempts):
         await raise_if_px_captcha_script_blocked(page)
-        if await _perimeterx_challenge_layer_visible(page):
+        challenge_visible = await _perimeterx_challenge_layer_visible(page)
+        if challenge_visible:
             await _prepare_perimeterx_page_for_challenge(page)
         button, where = await _captcha_button_locator(page, captcha_button_name)
+        if manual_mode == "always" and (challenge_visible or button is not None):
+            if await _attempt_manual_perimeterx_override(page):
+                return True
+            print(
+                f"    Manual CAPTCHA solve attempt {attempt + 1}/{max_attempts} did not clear challenge."
+            )
+            await asyncio.sleep(CAPTCHA_RECHECK_WAIT_SEC)
+            continue
         if button is not None:
             print(f"    CAPTCHA button in {where}...")
             if await solve_px_captcha_button(page, button):
@@ -1247,6 +1297,13 @@ async def check_and_handle_captcha(page, max_attempts: int = CAPTCHA_MAX_SOLVE_A
 
         # No captcha indicators found.
         return False
+
+    if manual_mode == "fallback" and await _perimeterx_challenge_layer_visible(page):
+        if await _attempt_manual_perimeterx_override(page):
+            return True
+        raise CaptchaUnresolvedError(
+            "PerimeterX CAPTCHA remained after manual terminal override attempt."
+        )
 
     raise CaptchaUnresolvedError(
         f"PerimeterX CAPTCHA not cleared after {max_attempts} attempt(s) (e.g. press-hold rejected or session flagged)."

@@ -54,6 +54,12 @@ The scraper iterates the configured drugs and ZIP codes. Each run saves one file
 
 Columns include `Date`, `Zip_Code`, `Drug_Name`, `Pharmacy_Name`, `Option_Type`, `Retail_Price`, `Retail_Flag`, and `GoodRx_Price`. For older workflows, a legacy `national_pharmacy_pricing.csv` in the repo root can be merged in via `merge_runs.py` (see below).
 
+Optional manual CAPTCHA fallback:
+
+- Set `GOODRX_MANUAL_PERIMETERX=fallback` to keep automated solve first, then pause for manual solve only if PerimeterX still blocks after configured attempts.
+- Set `GOODRX_MANUAL_PERIMETERX=always` to always pause for manual solve whenever a PerimeterX challenge is detected.
+- Manual mode requires a visible browser window and interactive terminal input (`stdin` must be a TTY); in non-interactive runs, the scraper raises a clear error instead of hanging.
+
 ### Merge multiple runs (optional)
 
 Combine every `runs/prices_*.csv` (and optionally `national_pharmacy_pricing.csv`) into one file with a `Run_ID` column for time-series work:
